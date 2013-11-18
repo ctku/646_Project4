@@ -1,6 +1,11 @@
 #define TRUE 1
 #define FALSE 0
 
+#define INVALID   0
+#define EXCLUSIVE 1
+#define MODIFIED  2
+#define SHARED    3
+
 /* default cache parameters--can be changed */
 #define WORD_SIZE 4
 #define WORD_SIZE_OFFSET 2
@@ -21,7 +26,7 @@
 typedef struct cache_line_ {
   unsigned tag;
   int state;
-  int dirty;//added for testing, to be removed
+
   struct cache_line_ *LRU_next;
   struct cache_line_ *LRU_prev;
 } cache_line, *Pcache_line;

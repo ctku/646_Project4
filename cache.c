@@ -17,7 +17,6 @@ static int num_core = DEFAULT_NUM_CORE;
 /* max of 8 cores */
 static cache mesi_cache[8];
 static cache_stat mesi_cache_stat[8];
-static int core;
 
 /************************************************************/
 void set_cache_param(param, value)
@@ -55,9 +54,9 @@ void init_cache()
 	
 	for (i=0; i<num_core; i++) {
 		c1 = &mesi_cache[i];
-		c1->size =  cache_usize;        /* cache size */
+		c1->size = cache_usize;        /* cache size */
 		c1->associativity = cache_assoc;                              /* cache associativity */
-		c1->n_sets = (c1->size / cache_block_size) / cache_assoc;;     /* number of cache sets */
+		c1->n_sets = (c1->size / cache_block_size) / cache_assoc;     /* number of cache sets */
 		nontag_bits = LOG2(c1->n_sets) + LOG2(cache_block_size);
 		c1->index_mask = (((2 << nontag_bits) - 1) >> LOG2(cache_block_size)) << LOG2(cache_block_size);/* mask to find cache index */
 		c1->index_mask_offset = LOG2(cache_block_size);               /* number of zero bits in mask */
@@ -72,101 +71,134 @@ void init_cache()
 /************************************************************/
 
 /************************************************************/
-extern void data_copy_cache2mem(int *dirty, int type);
-void inst_copy_mem2cache(int *old_tag, int new_tag)
+void remote_load_miss(int local_tag, int local_pid, int *tag_shared)
 {
-	mesi_cache_stat[core].demand_fetches += (cache_block_size>>2);
-	*old_tag = new_tag;
-}
+	Pcache_line cur;
+	int i, j, found = 0;
+	for (i=0; i<num_core; i++) {
+		if (i == local_pid)
+			continue;
 
-void inst_load_hit()
-{
-	// do nothing
-}
-
-void inst_load_miss(int empty, int replace, int old_dirty, int *new_dirty, int *old_tag, int new_tag)
-{
-	mesi_cache_stat[core].misses ++;
-	if (!empty) {
-		if (cache_writeback && old_dirty)
-			data_copy_cache2mem(new_dirty, CB_1LINE);
-		if (replace)
-			mesi_cache_stat[core].replacements ++;
-	}
-	inst_copy_mem2cache(old_tag, new_tag);
-}
-/************************************************************/
-
-/************************************************************/
-void data_copy_mem2cache(int *old_tag, int new_tag)
-{
-	mesi_cache_stat[core].demand_fetches += (cache_block_size>>2);
-	*old_tag = new_tag;
-}
-
-void data_copy_cache2mem(int *dirty, int type)
-{
-	int size = (type == CB_1WORD) ? 1 : (cache_block_size>>2);
-
-	mesi_cache_stat[core].copies_back += size;
-	*dirty = 0;
-}
-
-void data_load_hit()
-{
-	// do nothing
-}
-
-void data_load_miss(int empty, int replace, int old_dirty, int *new_dirty, int *old_tag, int new_tag)
-{
-	mesi_cache_stat[core].misses ++;
-	if (!empty) {
-		if (cache_writeback && old_dirty)
-			data_copy_cache2mem(new_dirty, CB_1LINE);
-		if (replace)
-			mesi_cache_stat[core].replacements ++;
-	}
-	data_copy_mem2cache(old_tag, new_tag);
-}
-
-void data_write_hit(int *dirty)
-{
-	// write through always generate 1 word to CB stats for DATA_STORE
-	if (!cache_writeback) {
-		data_copy_cache2mem(dirty, CB_1WORD);
-	}
-
-	if (cache_writeback) {
-		*dirty = 1;
-	}
-}
-
-void data_write_miss(int empty, int replace, int old_dirty, int *new_dirty, int *old_tag, int new_tag)
-{
-	// write through always generate 1 word to CB stats for DATA_STORE
-	if (!cache_writeback) {
-		int dummy;
-		data_copy_cache2mem(&dummy, CB_1WORD);
-	}
-
-	mesi_cache_stat[core].misses ++;
-	if (cache_writealloc) {
-		if (!empty) {
-			if (cache_writeback && old_dirty)
-				data_copy_cache2mem(new_dirty, CB_1LINE);
-			if (replace)
-				mesi_cache_stat[core].replacements ++;
+		found = 0;
+		for (j=0; j<mesi_cache[i].n_sets; j++) {
+			cur = (Pcache_line)mesi_cache[i].LRU_head[j];
+			while (cur) {
+				if (local_tag == cur->tag) {
+					found = 1;
+					// (3) maintain remote cache state
+					if ((cur->state == EXCLUSIVE) || (cur->state == SHARED)) {
+						cur->state = SHARED;
+					} else if (cur->state == MODIFIED) {
+						cur->state = SHARED;
+						mesi_cache_stat[i].copies_back ++;
+					}
+					break;
+				}
+				cur = cur->LRU_next;
+			}
 		}
-		data_copy_mem2cache(old_tag, new_tag);
-		// then CPU write to cache again
-		if (cache_writeback) {
-			*new_dirty = 1;
-		}
+	}
+	*tag_shared = (found) ? 1 : 0;
+}
+
+void load_miss(Pcache_line local_cline, int local_tag, int local_pid)
+{
+	Pcache_line cur;
+	int tag_shared;
+
+	mesi_cache_stat[local_pid].misses ++;
+	mesi_cache_stat[local_pid].demand_fetches ++;
+	mesi_cache_stat[local_pid].broadcasts ++;
+
+	remote_load_miss(local_tag, local_pid, &tag_shared);
+
+	// (1) maintain local cache state (special case, handle local after knowing remote)
+	if (tag_shared) {
+		// INVALID -> SHARED
+		local_cline->state = SHARED;
 	} else {
-		// copy data from cpu to mem, no replacement
-		int dummy;
-		data_copy_cache2mem(&dummy, CB_1WORD);
+		// INVALID -> EXCLUSIVE
+		local_cline->state = EXCLUSIVE;
 	}
+}
+
+void load_hit()
+{
+	// (2) do nothing
+}
+
+void remote_write_miss(int local_tag, int local_pid)
+{
+	Pcache_line cur;
+	int i, j, found = 0;
+	for (i=0; i<num_core; i++) {
+		if (i == local_pid)
+			continue;
+		
+		found = 0;
+		for (j=0; j<mesi_cache[i].n_sets; j++) {
+			cur = (Pcache_line)mesi_cache[i].LRU_head[j];
+			while (cur) {
+				if (local_tag == cur->tag) {
+					found = 1;
+					// (6) maintain remote cache state
+					if (cur->state != INVALID) {
+						cur->state = INVALID;
+					}
+					break;
+				}
+				cur = cur->LRU_next;
+			}
+		}
+	}
+}
+
+void write_miss(Pcache_line local_cline, int local_tag, int local_pid)
+{
+	mesi_cache_stat[local_pid].misses ++;
+	mesi_cache_stat[local_pid].demand_fetches ++;
+	mesi_cache_stat[local_pid].broadcasts ++;
+
+	// (4)
+	local_cline->state = MODIFIED;
+
+	remote_write_miss(local_tag, local_pid);
+}
+
+void remote_write_hit(int local_tag, int local_pid)
+{
+	Pcache_line cur;
+	int i, j, found = 0;
+	for (i=0; i<num_core; i++) {
+		if (i == local_pid)
+			continue;
+		
+		found = 0;
+		for (j=0; j<mesi_cache[i].n_sets; j++) {
+			cur = (Pcache_line)mesi_cache[i].LRU_head[j];
+			while (cur) {
+				if (local_tag == cur->tag) {
+					found = 1;
+					// (7) maintain remote cache state
+					if (cur->state == SHARED) {
+						cur->state = INVALID;
+					}
+					break;
+				}
+				cur = cur->LRU_next;
+			}
+		}
+	}
+}
+
+void write_hit(Pcache_line local_cline, int local_tag, int local_pid)
+{
+	if (local_cline->state == SHARED) {
+		remote_write_hit(local_tag, local_pid);
+	}
+
+	// (5)
+	local_cline->state = MODIFIED;
 }
 /************************************************************/
 
@@ -174,10 +206,10 @@ void data_write_miss(int empty, int replace, int old_dirty, int *new_dirty, int 
 void perform_access(unsigned addr, unsigned access_type, unsigned pid)
 {
 	/* handle an access to the cache */
-	int i, c1_nontag_bits = 0, c1_tag = 0, c1_idx = 0, c1_no = 0;
+	int i, c1_nontag_bits = 0, c1_tag = 0, c1_idx = 0, c1_no = 0, tag_shared = 0, found;
 	Pcache_line c1_line;
-	Pcache_line new_node;
-	cache *c1 = &mesi_cache[core];
+	Pcache_line cur;
+	cache *c1 = &mesi_cache[pid];
 
 	c1_nontag_bits = ceil(LOG2_FL(c1->n_sets)) + LOG2(cache_block_size);
 	c1_tag = addr >> c1_nontag_bits;
@@ -188,133 +220,95 @@ void perform_access(unsigned addr, unsigned access_type, unsigned pid)
 	/* update access */
 	switch (access_type) {
 	case TRACE_LOAD:
-		mesi_cache_stat[core].accesses ++;
-		if (c1_no == 0) {
-			// Miss
-			new_node = (Pcache_line)malloc(sizeof(cache_line));
-			memset(new_node, 0, sizeof(cache_line));
-			insert(&c1->LRU_head[c1_idx], &c1->LRU_tail[c1_idx], new_node);
-			c1->set_contents[c1_idx] ++;
-			data_load_miss(1, 0, new_node->dirty, &new_node->dirty, &new_node->tag, c1_tag);
-		} else {
-			Pcache_line cur = (Pcache_line)c1->LRU_head[c1_idx];
-			int found = 0;
-			while (cur) {
-				if (c1_tag == cur->tag) {
-					found = 1;
-					break;
-				}
-				cur = cur->LRU_next;
+		mesi_cache_stat[pid].accesses ++;
+
+		// check if tag is matched
+		cur = (Pcache_line)c1->LRU_head[c1_idx];
+		if (c1_idx==78)
+			c1_idx = c1_idx;
+		found = 0;
+		while (cur) {
+			if (c1_tag == cur->tag) {
+				found = 1;
+				break;
 			}
-			if (!found) {
-				// Miss
-				if (c1_no < cache_assoc) {
-					// Insertable
-					new_node = (Pcache_line)malloc(sizeof(cache_line));
-					memset(new_node, 0, sizeof(cache_line));
-					insert(&c1->LRU_head[c1_idx], &c1->LRU_tail[c1_idx], new_node);
-					c1->set_contents[c1_idx] ++;
-					data_load_miss(0, 0, new_node->dirty, &new_node->dirty, &new_node->tag, c1_tag);
-				} else {
-					// Not Insertable, need replace LRU
-					// delete(tail)
-					int old_dirty = c1->LRU_tail[c1_idx]->dirty;
-					delete(&c1->LRU_head[c1_idx], &c1->LRU_tail[c1_idx], c1->LRU_tail[c1_idx]);
-					if (old_dirty==1)
-						old_dirty = old_dirty;
-					c1->set_contents[c1_idx] --;
-					// insert(new)
-					new_node = (Pcache_line)malloc(sizeof(cache_line));
-					memset(new_node, 0, sizeof(cache_line));
-					insert(&c1->LRU_head[c1_idx], &c1->LRU_tail[c1_idx], new_node);
-					c1->set_contents[c1_idx] ++;
-					data_load_miss(0, 1, old_dirty, &new_node->dirty, &new_node->tag, c1_tag);
-				}
+			cur = cur->LRU_next;
+		}
+		if (!found) {
+			// Read Miss
+			if (c1_no < cache_assoc) {
+				// Insertable
+				cur = (Pcache_line)malloc(sizeof(cache_line));
+				memset(cur, 0, sizeof(cache_line));
+				cur->tag = c1_tag;
+				insert(&c1->LRU_head[c1_idx], &c1->LRU_tail[c1_idx], cur);
+				c1->set_contents[c1_idx] ++;
 			} else {
-				// Hit
-				if (c1_no > 1) {
-					// switch nodes to maintain order of LRU
-					delete(&c1->LRU_head[c1_idx], &c1->LRU_tail[c1_idx], cur);
-					insert(&c1->LRU_head[c1_idx], &c1->LRU_tail[c1_idx], cur);
-				}
-				data_load_hit();
+				// Not Insertable, need replace LRU
+				// delete(tail)
+				delete(&c1->LRU_head[c1_idx], &c1->LRU_tail[c1_idx], c1->LRU_tail[c1_idx]);
+				c1->set_contents[c1_idx] --;
+				// insert(new)
+				cur = (Pcache_line)malloc(sizeof(cache_line));
+				memset(cur, 0, sizeof(cache_line));
+				cur->tag = c1_tag;
+				insert(&c1->LRU_head[c1_idx], &c1->LRU_tail[c1_idx], cur);
+				c1->set_contents[c1_idx] ++;
 			}
+			load_miss(cur, c1_tag, pid);
+		} else {
+			// Read Hit
+			if (c1_no > 1) {
+				// switch nodes to maintain order of LRU
+				delete(&c1->LRU_head[c1_idx], &c1->LRU_tail[c1_idx], cur);
+				insert(&c1->LRU_head[c1_idx], &c1->LRU_tail[c1_idx], cur);
+			}
+			load_hit();
 		}
 		break;
 	case TRACE_STORE:
-		mesi_cache_stat[core].accesses ++;
-		if (cache_writealloc) {
-			if (c1_no == 0) {
-				// Miss
-				new_node = (Pcache_line)malloc(sizeof(cache_line));
-				memset(new_node, 0, sizeof(cache_line));
-				insert(&c1->LRU_head[c1_idx], &c1->LRU_tail[c1_idx], new_node);
+		mesi_cache_stat[pid].accesses ++;
+
+		// check if tag is matched
+		cur = (Pcache_line)c1->LRU_head[c1_idx];
+		found = 0;
+		while (cur) {
+			if (c1_tag == cur->tag) {
+				found = 1;
+				break;
+			}
+			cur = cur->LRU_next;
+		}
+		if (!found) {
+			// Write Miss
+			if (c1_no < cache_assoc) {
+				// Insertable
+				cur = (Pcache_line)malloc(sizeof(cache_line));
+				memset(cur, 0, sizeof(cache_line));
+				cur->tag = c1_tag;
+				insert(&c1->LRU_head[c1_idx], &c1->LRU_tail[c1_idx], cur);
 				c1->set_contents[c1_idx] ++;
-				data_write_miss(1, 0, new_node->dirty, &new_node->dirty, &new_node->tag, c1_tag);
 			} else {
-				Pcache_line cur = (Pcache_line)c1->LRU_head[c1_idx];
-				int found = 0;
-				while (cur) {
-					if (c1_tag == cur->tag) {
-						found = 1;
-						break;
-					}
-					cur = cur->LRU_next;
-				}
-				if (!found) {
-					// Miss
-					if (c1_no < cache_assoc) {
-						// Insertable
-						new_node = (Pcache_line)malloc(sizeof(cache_line));
-						memset(new_node, 0, sizeof(cache_line));
-						insert(&c1->LRU_head[c1_idx], &c1->LRU_tail[c1_idx], new_node);
-						c1->set_contents[c1_idx] ++;
-						data_write_miss(0, 0, new_node->dirty, &new_node->dirty, &new_node->tag, c1_tag);
-					} else {
-						// Not Insertable, need replace LRU
-						// delete(tail)
-						int old_dirty = c1->LRU_tail[c1_idx]->dirty;
-						delete(&c1->LRU_head[c1_idx], &c1->LRU_tail[c1_idx], c1->LRU_tail[c1_idx]);
-						c1->set_contents[c1_idx] --;
-						// insert(new)
-						new_node = (Pcache_line)malloc(sizeof(cache_line));
-						memset(new_node, 0, sizeof(cache_line));
-						insert(&c1->LRU_head[c1_idx], &c1->LRU_tail[c1_idx], new_node);
-						c1->set_contents[c1_idx] ++;
-						data_write_miss(0, 1, old_dirty, &new_node->dirty, &new_node->tag, c1_tag);
-					}
-				} else {
-					// Hit
-					if (c1_no > 1) {
-						// switch nodes to maintain order of LRU
-						delete(&c1->LRU_head[c1_idx], &c1->LRU_tail[c1_idx], cur);
-						insert(&c1->LRU_head[c1_idx], &c1->LRU_tail[c1_idx], cur);
-					}
-					data_write_hit(&cur->dirty);
-				}
+				// Not Insertable, need replace LRU
+				// delete(tail)
+				delete(&c1->LRU_head[c1_idx], &c1->LRU_tail[c1_idx], c1->LRU_tail[c1_idx]);
+				c1->set_contents[c1_idx] --;
+				// insert(new)
+				cur = (Pcache_line)malloc(sizeof(cache_line));
+				memset(cur, 0, sizeof(cache_line));
+				cur->tag = c1_tag;
+				insert(&c1->LRU_head[c1_idx], &c1->LRU_tail[c1_idx], cur);
+				c1->set_contents[c1_idx] ++;
 			}
+			write_miss(cur, c1_tag, pid);
 		} else {
-			// Write non allocate
-			Pcache_line cur = (Pcache_line)c1->LRU_head[c1_idx];
-			int found = 0, dummy = 0;
-			while (cur) {
-				if (c1_tag == cur->tag) {
-					found = 1;
-					break;
-				}
-				cur = cur->LRU_next;
+			// Write Hit
+			if (c1_no > 1) {
+				// switch nodes to maintain order of LRU
+				delete(&c1->LRU_head[c1_idx], &c1->LRU_tail[c1_idx], cur);
+				insert(&c1->LRU_head[c1_idx], &c1->LRU_tail[c1_idx], cur);
 			}
-			// no cache will be modified
-			if (found) {
-				if (c1_no > 1) {
-					// switch nodes to maintain order of LRU
-					delete(&c1->LRU_head[c1_idx], &c1->LRU_tail[c1_idx], cur);
-					insert(&c1->LRU_head[c1_idx], &c1->LRU_tail[c1_idx], cur);
-				}
-				data_write_hit(&cur->dirty);
-			} else {
-				data_write_miss(0, 0, 0, &dummy, &dummy, 0);
-			}
+			write_hit(cur, c1_tag, pid);
 		}
 		break;
 	}
@@ -326,14 +320,17 @@ void flush()
 {
 	/* flush the cache */
 	int i, j;
-	cache *c1 = &mesi_cache[core];
 
-	for (i=0; i<c1->n_sets; i++) {
-		Pcache_line cur = c1->LRU_head[i];
-		while (cur) {
-			if (cur->dirty)
-				data_copy_cache2mem(&c1->LRU_head[i]->dirty, CB_1LINE);
-			cur = cur->LRU_next;
+	for (j=0; j<num_core; j++) {
+		cache *c1 = &mesi_cache[j];
+
+		for (i=0; i<c1->n_sets; i++) {
+			Pcache_line cur = c1->LRU_head[i];
+			while (cur) {
+				if (cur->state == MODIFIED)
+					mesi_cache_stat[j].copies_back ++;
+				cur = cur->LRU_next;
+			}
 		}
 	}
 }
