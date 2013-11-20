@@ -13,11 +13,6 @@ int main(argc, argv)
   init_cache();
   play_trace(traceFile);
   print_stats();
-
-  {
-	  char a;
-	  scanf("%c",&a);
-  }
 }
 
 
